@@ -46,7 +46,7 @@ function mulberry32(seed) {
   };
 }
 const params = new URLSearchParams(location.search);
-const SEED = parseInt(params.get("seed") || "7", 10) || 7;
+const SEED = parseInt(params.get("seed") || "36", 10) || 36;
 const DEMO = params.get("demo") === "1";
 const STEP_MODE = params.get("step") === "1"; // recorder drives frames by hand
 const rng = mulberry32(SEED);
@@ -273,36 +273,91 @@ function popup(x, y, text, color, big) {
   if (G.pops.length > 12) G.pops.shift();
 }
 
-// ---------- autopilot: late, frame-perfect dodges ----------
+// ---------- autopilot: two-gate lookahead, early edge positioning ----------
+// Plans per axis: for each axis (x via 'v' gates, y via 'h' gates) the pilot
+// looks at the nearest gate of that kind AND the next one after it. The edge
+// it picks for the near gate is the one the following gate can still be
+// reached from — so the ship crosses early, while there is time, instead of
+// discovering the next gate too late. The other axis is pre-positioned the
+// same way, which is what paired (opposite-kind) gates need. Steering starts
+// far out (gentle) and hardens as the gate closes, so the ship is already
+// sitting on the gap edge when the gate sweeps past: the near-miss popups
+// and hold-then-dodge feel stay, the hull hits go away.
 function autopilotSteer(dt) {
   const P = G.player;
-  // Nearest gate still ahead of the ship.
-  let gate = null;
-  for (const g of G.gates) { if (g.z > 2 && g.z < 90) { gate = g; break; } }
-  let tx = P.x, ty = P.y;
-  if (gate) {
-    // Aim for the gap EDGE on the side the ship is already on, and hold
-    // position until the gate is close — the pilot threads the needle at
-    // the last millisecond, which is what makes the near-misses.
-    const dir = (gate.kind === "v" ? P.x - gate.c : P.y - gate.c) >= 0 ? 1 : -1;
-    const edge = gate.c + dir * (gate.half - 0.55);
-    const urgency = clamp(1 - gate.z / 26, 0, 1);
-    if (gate.kind === "v") { tx = edge; ty = P.y * 0.4; }
-    else { ty = edge; tx = P.x * 0.4; }
-    G.pilotInfo = { target: gate.kind === "v" ? tx : ty,
-      eta: gate.z / Math.max(G.speed, 1),
-      action: gate.z > 24 ? "TRACKING" : (urgency > 0.55 ? "DODGE!" : "LOCKED") };
-    // Steer harder the closer the gate gets.
-    const k = gate.z > 24 ? 2.5 : 6 + urgency * 30;
-    P.vx += clamp((tx - P.x) * k - P.vx * 4, -90, 90) * dt;
-    P.vy += clamp((ty - P.y) * k - P.vy * 4, -90, 90) * dt;
+  const VMAX = 22; // conservative sustained lateral speed (u/s) for planning
+
+  // Nearest gate overall (for the pilot readout).
+  let g1 = null;
+  for (const g of G.gates) {
+    if (g.z > 2 && g.z < 170) { g1 = g; break; }
+  }
+
+  // Plan one axis: return { target, z } for the nearest gate of `kind`,
+  // choosing the gap edge that keeps the NEXT gate of the same kind
+  // reachable, or null when no gate of that kind is ahead.
+  function axisPlan(kind, pos, lim) {
+    let a = null, b = null;
+    for (const g of G.gates) {
+      if (g.kind !== kind || g.z <= 2 || g.z >= 170) continue;
+      if (!a) a = g; else if (!b) { b = g; break; }
+    }
+    if (!a) return null;
+    const edge = (g, side) => clamp(g.c + side * (g.half - 0.55), -lim + 0.4, lim - 0.4);
+    const sideNow = (pos - a.c) >= 0 ? 1 : -1;
+    let best = null;
+    for (const s of [sideNow, -sideNow]) {
+      const e = edge(a, s);
+      let cost = Math.abs(e - pos);
+      let ok = true;
+      if (b) {
+        const dtAB = Math.max(0.05, (b.z - a.z) / Math.max(G.speed, 1));
+        const bs = (e - b.c) >= 0 ? 1 : -1;
+        const need = Math.abs(edge(b, bs) - e);
+        const can = VMAX * dtAB;
+        cost += need * 0.15;
+        if (need > can) { ok = false; cost += (need - can) * 8; }
+      }
+      if (!best || (ok && !best.ok) || (ok === best.ok && cost < best.cost)) {
+        best = { s, e, cost, ok };
+      }
+    }
+    return { target: best.e, z: a.z };
+  }
+
+  // Nearest orb ahead, for scooping cores on an axis with no gate.
+  let orb = null;
+  for (const o of G.orbs) { if (!o.taken && o.z > 2 && o.z < 70) { orb = o; break; } }
+
+  // Gain schedule: gentle early positioning, hard corrections up close.
+  const gainFor = (z) => {
+    if (z > 45) return 4;
+    if (z > 24) return 7;
+    const urgency = clamp(1 - z / 26, 0, 1);
+    return 8 + urgency * 30;
+  };
+
+  const px = axisPlan("v", P.x, 5.6);
+  const py = axisPlan("h", P.y, 3.0);
+
+  let tx, ty, kx, ky;
+  if (px) { tx = px.target; kx = gainFor(px.z); }
+  else if (orb) { tx = orb.x; kx = 5; }
+  else { tx = P.x * 0.4; kx = 5; }
+  if (py) { ty = py.target; ky = gainFor(py.z); }
+  else if (orb) { ty = orb.y; ky = 5; }
+  else { ty = P.y * 0.4; ky = 5; }
+
+  P.vx += clamp((tx - P.x) * kx - P.vx * 4, -120, 120) * dt;
+  P.vy += clamp((ty - P.y) * ky - P.vy * 4, -120, 120) * dt;
+
+  if (g1) {
+    const near = g1.kind === "v" ? px : py;
+    const urgency = clamp(1 - g1.z / 26, 0, 1);
+    G.pilotInfo = { target: near ? near.target : 0,
+      eta: g1.z / Math.max(G.speed, 1),
+      action: g1.z > 24 ? "TRACKING" : (urgency > 0.55 ? "DODGE!" : "LOCKED") };
   } else {
-    // No gate near: drift toward center and scoop cores.
-    let orb = null;
-    for (const o of G.orbs) { if (!o.taken && o.z > 2 && o.z < 70) { orb = o; break; } }
-    if (orb) { tx = orb.x; ty = orb.y; }
-    P.vx += clamp((tx - P.x) * 5 - P.vx * 4, -60, 60) * dt;
-    P.vy += clamp((ty - P.y) * 5 - P.vy * 4, -60, 60) * dt;
     G.pilotInfo = { target: 0, eta: 0, action: orb ? "COLLECT" : "CRUISE" };
   }
 }
@@ -445,13 +500,26 @@ function render() {
   }
 
   // Backdrop: vertical synthwave gradient + sun glow.
+  // Overdrive theme (combo >= 6): fiery gold/crimson palette + warp lines.
+  const od = G.combo >= 6;
+  const odAmt = od ? clamp(0.35 + (G.combo - 6) * 0.08, 0.35, 0.9) : 0;
   const bg = ctx.createLinearGradient(0, 0, 0, H);
-  bg.addColorStop(0, "#0a0620"); bg.addColorStop(0.55, "#12042e"); bg.addColorStop(1, "#2b0a3d");
+  if (od) {
+    bg.addColorStop(0, "#20060a"); bg.addColorStop(0.55, "#3d0a12"); bg.addColorStop(1, "#5c1503");
+  } else {
+    bg.addColorStop(0, "#0a0620"); bg.addColorStop(0.55, "#12042e"); bg.addColorStop(1, "#2b0a3d");
+  }
   ctx.fillStyle = bg; ctx.fillRect(-20, -20, W + 40, H + 40);
   const sun = ctx.createRadialGradient(CX, CY - 130, 10, CX, CY - 130, 320);
-  sun.addColorStop(0, "rgba(255, 90, 200, 0.55)");
-  sun.addColorStop(0.5, "rgba(255, 60, 120, 0.18)");
-  sun.addColorStop(1, "rgba(255, 60, 120, 0)");
+  if (od) {
+    sun.addColorStop(0, "rgba(255, 190, 60, 0.6)");
+    sun.addColorStop(0.5, "rgba(255, 60, 30, 0.22)");
+    sun.addColorStop(1, "rgba(255, 60, 30, 0)");
+  } else {
+    sun.addColorStop(0, "rgba(255, 90, 200, 0.55)");
+    sun.addColorStop(0.5, "rgba(255, 60, 120, 0.18)");
+    sun.addColorStop(1, "rgba(255, 60, 120, 0)");
+  }
   ctx.fillStyle = sun; ctx.fillRect(0, 0, W, H);
 
   // Starfield (drawn behind the trench).
@@ -475,7 +543,7 @@ function render() {
     const c4 = project(-TRENCH_HALF_W, TRENCH_HALF_H, zz);
     if (!c1 || !c2 || !c3 || !c4) continue;
     ctx.globalAlpha = fade * 0.75;
-    ctx.strokeStyle = "#22d3ee"; ctx.lineWidth = Math.max(1, 90 / zz);
+    ctx.strokeStyle = od ? "#ffd23c" : "#22d3ee"; ctx.lineWidth = Math.max(1, 90 / zz);
     ctx.beginPath();
     ctx.moveTo(c1.x, c1.y); ctx.lineTo(c2.x, c2.y);
     ctx.lineTo(c3.x, c3.y); ctx.lineTo(c4.x, c4.y); ctx.closePath(); ctx.stroke();
@@ -492,7 +560,26 @@ function render() {
     longLines.push([{ x: -TRENCH_HALF_W, y, z: 4 }, { x: -TRENCH_HALF_W, y, z: SPAWN_Z }]);
     longLines.push([{ x: TRENCH_HALF_W, y, z: 4 }, { x: TRENCH_HALF_W, y, z: SPAWN_Z }]);
   }
-  for (const [a, b] of longLines) line(a, b, "#ff2fb3", 2, 0.6);
+  for (const [a, b] of longLines) line(a, b, od ? "#ff2f2f" : "#ff2fb3", 2, 0.6);
+
+  // Overdrive warp speed-lines: radial gold/crimson streaks streaming
+  // outward from the center, intensity scaling with combo. Visual only.
+  if (od) {
+    for (let i = 0; i < 24; i++) {
+      const a = i * (TAU / 24) + 0.13;
+      const off = (G.t * 420 + i * 173) % 620;
+      const r0 = 260 + off, r1 = r0 + 90 + odAmt * 90;
+      if (r0 > 760) continue;
+      ctx.globalAlpha = odAmt * 0.45 * (1 - r0 / 760);
+      ctx.strokeStyle = i % 3 === 0 ? "#ff5a3c" : "#ffd23c";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(CX + Math.cos(a) * r0, CY + Math.sin(a) * r0);
+      ctx.lineTo(CX + Math.cos(a) * r1, CY + Math.sin(a) * r1);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
 
   // Energy cores: pulsing cyan diamonds.
   for (const o of G.orbs) {

@@ -8,6 +8,17 @@ HYPERDRIVE TRENCH 3D is a synthwave wireframe trench runner built by an AI agent
 
 Open `game/index.html` in a browser to play it — arrows/WASD or touch drag to fly, or press AI DEMO PILOT and watch it dodge.
 
+## AI Demo Pilot — perfect run (seed 36)
+
+The AI DEMO PILOT uses two-gate lookahead: per axis it plans the nearest
+gate and the next one after it, picking the gap edge that keeps the following
+gate reachable, and pre-positions the other axis early for paired gates.
+Default seed is **36** (`?seed=` overrides it). At seed 36 the pilot runs
+flawless: 0 hull hits over 31+ s, max COMBO x36 (every gate a near miss),
+max speed 663 KM/H, score 53,456 @ 15 s / 106,122 @ 20 s / 204,750 @ 25 s.
+When COMBO reaches 6 the tunnel shifts into the fiery gold/crimson
+Overdrive theme with radial warp speed-lines.
+
 ## Run it
 
 ```sh
