@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>HYPERDRIVE TRENCH 3D — one prompt, zero assets</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #020108; height: 100%; overflow: hidden;
+    font-family: "Courier New", ui-monospace, monospace; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, 100vh); height: min(100vw, 100vh); display: block;
+    background: #020108; touch-action: none; }
+  #btns { position: fixed; right: 12px; top: 12px; display: flex; gap: 8px; z-index: 5; }
+  #btns button { background: rgba(10, 8, 30, .72); color: #7df9ff; border: 1px solid #22d3ee;
+    border-radius: 8px; padding: 8px 12px; font: 700 13px "Courier New", monospace;
+    letter-spacing: 1px; cursor: pointer; }
+  #btns button.on { background: #f0f; color: #fff; border-color: #f0f; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1080" height="1080"></canvas></div>
+<div id="btns">
+  <button id="pilotBtn" title="Toggle AI autopilot (key A)">AI DEMO PILOT</button>
+  <button id="muteBtn" title="Toggle sound (key M)">SOUND ON</button>
+</div>
+<script>
+"use strict";
+/* HYPERDRIVE TRENCH 3D — a single-file synthwave trench runner.
+   No images, no fonts, no network: every pixel is drawn, every sound is
+   synthesized. A tiny custom perspective projector turns 3D trench
+   coordinates into screen space. */
+
+// ---------- tiny utilities ----------
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+
+// Deterministic generator so a run can be replayed exactly.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const params = new URLSearchParams(location.search);
+const SEED = parseInt(params.get("seed") || "7", 10) || 7;
+const DEMO = params.get("demo") === "1";
+const STEP_MODE = params.get("step") === "1"; // recorder drives frames by hand
+const rng = mulberry32(SEED);
+
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = 1080, H = 1080, CX = W / 2, CY = H / 2;
+
+// ---------- audio: everything synthesized with Web Audio ----------
+const AudioSys = {
+  ctx: null, master: null, muted: false, started: false, bassTimer: null, step: 0,
+  init() {
+    if (this.ctx) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.5;
+      this.master.connect(this.ctx.destination);
+    } catch (e) { this.ctx = null; }
+  },
+  unlock() {
+    this.init();
+    if (!this.ctx) return;
+    if (this.ctx.state === "suspended") this.ctx.resume();
+    if (!this.started) { this.started = true; this.startBass(); }
+  },
+  now() { return this.ctx ? this.ctx.currentTime : 0; },
+  // 132 BPM bassline: A-minor pattern, sawtooth through a lowpass.
+  startBass() {
+    if (!this.ctx) return;
+    const notes = [55.00, 55.00, 65.41, 55.00, 49.00, 55.00, 82.41, 73.42];
+    const beat = 60 / 132 / 2; // eighth notes
+    const tick = () => {
+      if (!this.ctx || this.muted) return;
+      const t0 = this.now() + 0.03;
+      const n = notes[this.step % notes.length];
+      const osc = this.ctx.createOscillator();
+      osc.type = "sawtooth"; osc.frequency.value = n;
+      const lp = this.ctx.createBiquadFilter();
+      lp.type = "lowpass"; lp.frequency.value = 720; lp.Q.value = 6;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.30, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + beat * 0.95);
+      osc.connect(lp); lp.connect(g); g.connect(this.master);
+      osc.start(t0); osc.stop(t0 + beat);
+      // Kick on every beat (every other eighth).
+      if (this.step % 2 === 0) {
+        const k = this.ctx.createOscillator();
+        k.type = "sine";
+        k.frequency.setValueAtTime(150, t0);
+        k.frequency.exponentialRampToValueAtTime(48, t0 + 0.11);
+        const kg = this.ctx.createGain();
+        kg.gain.setValueAtTime(0.55, t0);
+        kg.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.14);
+        k.connect(kg); kg.connect(this.master);
+        k.start(t0); k.stop(t0 + 0.15);
+      }
+      // Hat on the off-beat: short burst of shaped noise.
+      if (this.step % 2 === 1) {
+        const len = Math.floor(this.ctx.sampleRate * 0.05);
+        const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+        const src = this.ctx.createBufferSource(); src.buffer = buf;
+        const hp = this.ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 7000;
+        const hg = this.ctx.createGain(); hg.gain.value = 0.10;
+        src.connect(hp); hp.connect(hg); hg.connect(this.master);
+        src.start(t0);
+      }
+      this.step++;
+    };
+    tick();
+    this.bassTimer = setInterval(tick, beat * 1000);
+  },
+  zap() { // laser sweep, used on near misses
+    if (!this.ctx || this.muted) return;
+    const t0 = this.now();
+    const o = this.ctx.createOscillator(); o.type = "square";
+    o.frequency.setValueAtTime(1400, t0);
+    o.frequency.exponentialRampToValueAtTime(240, t0 + 0.14);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.22, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.15);
+    o.connect(g); g.connect(this.master); o.start(t0); o.stop(t0 + 0.16);
+  },
+  boom() { // explosion: noise burst through a falling lowpass
+    if (!this.ctx || this.muted) return;
+    const t0 = this.now();
+    const len = Math.floor(this.ctx.sampleRate * 0.5);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len) * (1 - i / len);
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const lp = this.ctx.createBiquadFilter(); lp.type = "lowpass";
+    lp.frequency.setValueAtTime(3200, t0);
+    lp.frequency.exponentialRampToValueAtTime(120, t0 + 0.45);
+    const g = this.ctx.createGain(); g.gain.value = 0.6;
+    src.connect(lp); lp.connect(g); g.connect(this.master); src.start(t0);
+  },
+  blip() { // pickup chirp
+    if (!this.ctx || this.muted) return;
+    const t0 = this.now();
+    const o = this.ctx.createOscillator(); o.type = "sine";
+    o.frequency.setValueAtTime(660, t0);
+    o.frequency.exponentialRampToValueAtTime(1320, t0 + 0.09);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.20, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+    o.connect(g); g.connect(this.master); o.start(t0); o.stop(t0 + 0.13);
+  },
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.5;
+    return !this.muted;
+  }
+};
+
+// ---------- world constants ----------
+const FOCAL = 920;            // projection focal length (px)
+const CAM_Z = 10;             // camera sits this far behind the near plane
+const TRENCH_HALF_W = 7;      // trench half width (world units)
+const TRENCH_HALF_H = 4.2;    // trench half height
+const SPAWN_Z = 230;          // where gates and cores appear
+const RING_GAP = 6;           // distance between trench rings
+const PLAYER_Z = 6;           // player plane (near the camera)
+
+// Project a 3D point into screen space. Returns null behind the camera.
+function project(x, y, z) {
+  const d = z + CAM_Z;
+  if (d < 2) return null;
+  const s = FOCAL / d;
+  return { x: CX + x * s, y: CY - y * s, s };
+}
+
+// ---------- game state ----------
+const G = {
+  mode: "title",           // title | playing | over
+  t: 0,                    // run clock (seconds)
+  elapsed: 0,
+  speed: 0,                // world units per second
+  dist: 0,
+  score: 0,
+  combo: 0,
+  bestCombo: 0,
+  hull: 3,
+  cores: 0,
+  nearMiss: 0,
+  shake: 0,                // screen-shake energy 0..1
+  freeze: 0,               // hit-stop timer (seconds of frozen frame)
+  invuln: 0,
+  zOff: 0,                 // scrolling offset of the trench rings
+  player: { x: 0, y: 0, vx: 0, vy: 0, tilt: 0 },
+  gates: [],               // {z, kind:'v'|'h', c (gap center), half, passed}
+  orbs: [],                // {x, y, z, taken, phase}
+  parts: [],               // {x,y,z,vx,vy,vz,life,maxLife,color,size}
+  pops: [],                // {x, y, text, life, color, big}
+  stars: [],
+  keys: {},
+  autopilot: false,
+  pilotInfo: { target: 0, eta: 0, action: "SCANNING" },
+  nextGateZ: 60,
+  nextOrbZ: 40,
+  flash: 0,
+};
+
+function resetRun() {
+  G.t = 0; G.elapsed = 0; G.speed = 36; G.dist = 0; G.score = 0;
+  G.combo = 0; G.bestCombo = 0; G.hull = 3; G.cores = 0; G.nearMiss = 0;
+  G.shake = 0; G.freeze = 0; G.invuln = 0; G.zOff = 0;
+  G.player.x = 0; G.player.y = 0; G.player.vx = 0; G.player.vy = 0; G.player.tilt = 0;
+  G.gates.length = 0; G.orbs.length = 0; G.parts.length = 0; G.pops.length = 0;
+  G.nextGateZ = 70; G.nextOrbZ = 46;
+  // Starfield: a wide box of points streaming past the camera.
+  G.stars.length = 0;
+  for (let i = 0; i < 240; i++) {
+    G.stars.push({
+      x: (rng() * 2 - 1) * 26, y: (rng() * 2 - 1) * 16,
+      z: rng() * SPAWN_Z, r: 0.6 + rng() * 1.8,
+      c: rng() < 0.75 ? "#ffffff" : (rng() < 0.5 ? "#7df9ff" : "#ff7df9"),
+    });
+  }
+}
+
+function spawnGate(z) {
+  // Difficulty ramps: gaps shrink and gates come in pairs later on.
+  const diff = clamp(G.elapsed / 75, 0, 1);
+  const half = lerp(2.6, 1.7, diff);
+  const kind = rng() < 0.5 ? "v" : "h";
+  const c = (rng() * 2 - 1) * (kind === "v" ? 3.4 : 1.9);
+  G.gates.push({ z, kind, c, half, passed: false });
+  if (diff > 0.45 && rng() < 0.5) {
+    // A second, tighter gate trailing the first.
+    G.gates.push({ z: z + 26, kind: kind === "v" ? "h" : "v",
+      c: (rng() * 2 - 1) * 2.2, half: half * 0.9, passed: false });
+  }
+}
+
+function spawnOrb(z) {
+  // Energy cores: sometimes a line of three, sometimes one.
+  const n = rng() < 0.4 ? 3 : 1;
+  const bx = (rng() * 2 - 1) * 4.4, by = (rng() * 2 - 1) * 2.4;
+  for (let i = 0; i < n; i++) {
+    G.orbs.push({ x: clamp(bx + (rng() - 0.5), -5.4, 5.4),
+      y: clamp(by + (rng() - 0.5), -2.8, 2.8),
+      z: z + i * 7, taken: false, phase: rng() * TAU });
+  }
+}
+
+function burst(x, y, z, color, n, power) {
+  for (let i = 0; i < n; i++) {
+    const a = rng() * TAU, b = rng() * TAU, sp = (0.4 + rng() * 0.6) * power;
+    G.parts.push({ x, y, z,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * Math.sin(b) * sp, vz: Math.cos(b) * sp - 6,
+      life: 0, maxLife: 0.5 + rng() * 0.7, color,
+      size: 1.5 + rng() * 3.5 });
+  }
+  if (G.parts.length > 420) G.parts.splice(0, G.parts.length - 420);
+}
+
+function popup(x, y, text, color, big) {
+  G.pops.push({ x, y, text, life: 0, maxLife: big ? 1.3 : 0.9, color, big: !!big });
+  if (G.pops.length > 12) G.pops.shift();
+}
+
+// ---------- autopilot: late, frame-perfect dodges ----------
+function autopilotSteer(dt) {
+  const P = G.player;
+  // Nearest gate still ahead of the ship.
+  let gate = null;
+  for (const g of G.gates) { if (g.z > 2 && g.z < 90) { gate = g; break; } }
+  let tx = P.x, ty = P.y;
+  if (gate) {
+    // Aim for the gap EDGE on the side the ship is already on, and hold
+    // position until the gate is close — the pilot threads the needle at
+    // the last millisecond, which is what makes the near-misses.
+    const dir = (gate.kind === "v" ? P.x - gate.c : P.y - gate.c) >= 0 ? 1 : -1;
+    const edge = gate.c + dir * (gate.half - 0.55);
+    const urgency = clamp(1 - gate.z / 26, 0, 1);
+    if (gate.kind === "v") { tx = edge; ty = P.y * 0.4; }
+    else { ty = edge; tx = P.x * 0.4; }
+    G.pilotInfo = { target: gate.kind === "v" ? tx : ty,
+      eta: gate.z / Math.max(G.speed, 1),
+      action: gate.z > 24 ? "TRACKING" : (urgency > 0.55 ? "DODGE!" : "LOCKED") };
+    // Steer harder the closer the gate gets.
+    const k = gate.z > 24 ? 2.5 : 6 + urgency * 30;
+    P.vx += clamp((tx - P.x) * k - P.vx * 4, -90, 90) * dt;
+    P.vy += clamp((ty - P.y) * k - P.vy * 4, -90, 90) * dt;
+  } else {
+    // No gate near: drift toward center and scoop cores.
+    let orb = null;
+    for (const o of G.orbs) { if (!o.taken && o.z > 2 && o.z < 70) { orb = o; break; } }
+    if (orb) { tx = orb.x; ty = orb.y; }
+    P.vx += clamp((tx - P.x) * 5 - P.vx * 4, -60, 60) * dt;
+    P.vy += clamp((ty - P.y) * 5 - P.vy * 4, -60, 60) * dt;
+    G.pilotInfo = { target: 0, eta: 0, action: orb ? "COLLECT" : "CRUISE" };
+  }
+}
+
+// ---------- update ----------
+function update(dt) {
+  if (G.mode !== "playing") return;
+  // Hit-stop: freeze the world for a beat after a near miss or a hit.
+  if (G.freeze > 0) { G.freeze -= dt; return; }
+  G.t += dt; G.elapsed += dt;
+  G.speed = Math.min(36 + G.elapsed * 1.15, 112);
+  G.dist += G.speed * dt;
+  G.score += G.speed * dt * 0.55;
+  G.zOff += G.speed * dt;
+  G.shake = Math.max(0, G.shake - dt * 2.2);
+  G.flash = Math.max(0, G.flash - dt * 3);
+  if (G.invuln > 0) G.invuln -= dt;
+
+  const P = G.player;
+  if (G.autopilot) {
+    autopilotSteer(dt);
+  } else {
+    // Manual: arrows / WASD / drag.
+    const ax = (G.keys["ArrowRight"] || G.keys["KeyD"] ? 1 : 0)
+             - (G.keys["ArrowLeft"] || G.keys["KeyA"] ? 1 : 0);
+    const ay = (G.keys["ArrowUp"] || G.keys["KeyW"] ? 1 : 0)
+             - (G.keys["ArrowDown"] || G.keys["KeyS"] ? 1 : 0);
+    P.vx += ax * 130 * dt; P.vy += ay * 110 * dt;
+    P.vx *= Math.pow(0.0015, dt); P.vy *= Math.pow(0.0015, dt);
+  }
+  P.x = clamp(P.x + P.vx * dt, -5.6, 5.6);
+  P.y = clamp(P.y + P.vy * dt, -3.0, 3.0);
+  P.tilt = lerp(P.tilt, clamp(P.vx * 0.02, -0.5, 0.5), dt * 10);
+
+  // Spawn gates and cores ahead.
+  if (G.nextGateZ < SPAWN_Z) { spawnGate(G.nextGateZ); G.nextGateZ += 34 + rng() * 22; }
+  if (G.nextOrbZ < SPAWN_Z) { spawnOrb(G.nextOrbZ); G.nextOrbZ += 30 + rng() * 30; }
+
+  // Move the world toward the camera.
+  const dz = G.speed * dt;
+  for (const g of G.gates) g.z -= dz;
+  for (const o of G.orbs) o.z -= dz;
+  for (const s of G.stars) { s.z -= dz * 0.55; if (s.z < 1) { s.z += SPAWN_Z; s.x = (rng() * 2 - 1) * 26; s.y = (rng() * 2 - 1) * 16; } }
+
+  // Gates crossing the player plane.
+  for (const g of G.gates) {
+    if (!g.passed && g.z <= PLAYER_Z) {
+      g.passed = true;
+      const inside = g.kind === "v"
+        ? Math.abs(P.x - g.c) < g.half
+        : Math.abs(P.y - g.c) < g.half;
+      if (inside) {
+        // Clearance to the nearest bar edge decides near-miss vs clean pass.
+        const clear = g.kind === "v"
+          ? g.half - Math.abs(P.x - g.c)
+          : g.half - Math.abs(P.y - g.c);
+        if (clear < 1.05) {
+          G.combo++; G.bestCombo = Math.max(G.bestCombo, G.combo);
+          const bonus = 500 * G.combo;
+          G.score += bonus; G.nearMiss++;
+          popup(P.x, P.y + 1.6, "NEAR MISS +" + bonus + "!", "#ffe14d", true);
+          G.shake = 1; G.freeze = 0.07; G.flash = 0.35;
+          AudioSys.zap();
+          burst(P.x, P.y, PLAYER_Z, "#ffe14d", 14, 7);
+        } else {
+          G.score += 100;
+        }
+      } else if (G.invuln <= 0) {
+        // Hit: hull loss, explosion, slow-down.
+        G.hull--; G.combo = 0;
+        G.shake = 1; G.freeze = 0.12; G.flash = 0.8;
+        AudioSys.boom();
+        burst(P.x, P.y, PLAYER_Z, "#ff5a3c", 46, 13);
+        burst(P.x, P.y, PLAYER_Z, "#ffd23c", 22, 9);
+        popup(P.x, P.y + 1.6, "HULL HIT!", "#ff5a3c", true);
+        G.speed = Math.max(30, G.speed * 0.7);
+        G.invuln = 1.6;
+        if (G.hull <= 0) {
+          G.mode = "over";
+          burst(P.x, P.y, PLAYER_Z, "#ff5a3c", 90, 18);
+          burst(P.x, P.y, PLAYER_Z, "#ffffff", 40, 12);
+          setTimeout(() => { if (G.autopilot) startRun(); }, 2400);
+        }
+      }
+    }
+  }
+  G.gates = G.gates.filter(g => g.z > -30);
+  G.nextGateZ -= dz; G.nextOrbZ -= dz;
+
+  // Cores: collect on proximity.
+  for (const o of G.orbs) {
+    if (!o.taken && Math.abs(o.z - PLAYER_Z) < 1.6) {
+      const d = Math.hypot(o.x - P.x, o.y - P.y);
+      if (d < 1.25) {
+        o.taken = true; G.cores++; G.score += 150;
+        AudioSys.blip();
+        burst(o.x, o.y, PLAYER_Z, "#37f4ff", 12, 6);
+        popup(o.x, o.y + 1, "+150", "#37f4ff", false);
+      }
+    }
+  }
+  G.orbs = G.orbs.filter(o => o.z > -10 && !o.taken);
+
+  // Particles and popups age.
+  for (const p of G.parts) {
+    p.life += dt;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+    p.vz -= 14 * dt;
+  }
+  G.parts = G.parts.filter(p => p.life < p.maxLife);
+  for (const p of G.pops) p.life += dt;
+  G.pops = G.pops.filter(p => p.life < p.maxLife);
+
+  // Engine trail sparkle.
+  if (rng() < 0.6) {
+    G.parts.push({ x: P.x + (rng() - 0.5) * 0.5, y: P.y - 0.35, z: PLAYER_Z + 2,
+      vx: (rng() - 0.5) * 2, vy: -1 - rng() * 2, vz: -10 - rng() * 8,
+      life: 0, maxLife: 0.35, color: rng() < 0.5 ? "#ff9df9" : "#37f4ff", size: 1.6 });
+  }
+}
+
+// ---------- render ----------
+function line(a, b, color, width, alpha) {
+  const pa = project(a.x, a.y, a.z), pb = project(b.x, b.y, b.z);
+  if (!pa || !pb) return;
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  ctx.strokeStyle = color; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function render() {
+  ctx.save();
+  ctx.fillStyle = "#020108";
+  ctx.fillRect(0, 0, W, H);
+  // Screen shake: offset everything by a decaying random jolt.
+  if (G.shake > 0) {
+    const m = G.shake * G.shake * 16;
+    ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+  }
+
+  // Backdrop: vertical synthwave gradient + sun glow.
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#0a0620"); bg.addColorStop(0.55, "#12042e"); bg.addColorStop(1, "#2b0a3d");
+  ctx.fillStyle = bg; ctx.fillRect(-20, -20, W + 40, H + 40);
+  const sun = ctx.createRadialGradient(CX, CY - 130, 10, CX, CY - 130, 320);
+  sun.addColorStop(0, "rgba(255, 90, 200, 0.55)");
+  sun.addColorStop(0.5, "rgba(255, 60, 120, 0.18)");
+  sun.addColorStop(1, "rgba(255, 60, 120, 0)");
+  ctx.fillStyle = sun; ctx.fillRect(0, 0, W, H);
+
+  // Starfield (drawn behind the trench).
+  for (const s of G.stars) {
+    const p = project(s.x, s.y, s.z);
+    if (!p) continue;
+    ctx.globalAlpha = clamp(p.s / 14, 0.15, 1);
+    ctx.fillStyle = s.c;
+    ctx.fillRect(p.x - s.r * p.s / 8, p.y - s.r * p.s / 8, s.r * p.s / 4 + 0.6, s.r * p.s / 4 + 0.6);
+  }
+  ctx.globalAlpha = 1;
+
+  // Trench rings: transverse neon rectangles scrolling toward the camera.
+  const off = G.zOff % RING_GAP;
+  for (let zz = SPAWN_Z - off; zz > 4; zz -= RING_GAP) {
+    if (zz < 4 || zz > SPAWN_Z) continue;
+    const fade = clamp(1 - zz / SPAWN_Z, 0.12, 0.9);
+    const c1 = project(-TRENCH_HALF_W, -TRENCH_HALF_H, zz);
+    const c2 = project(TRENCH_HALF_W, -TRENCH_HALF_H, zz);
+    const c3 = project(TRENCH_HALF_W, TRENCH_HALF_H, zz);
+    const c4 = project(-TRENCH_HALF_W, TRENCH_HALF_H, zz);
+    if (!c1 || !c2 || !c3 || !c4) continue;
+    ctx.globalAlpha = fade * 0.75;
+    ctx.strokeStyle = "#22d3ee"; ctx.lineWidth = Math.max(1, 90 / zz);
+    ctx.beginPath();
+    ctx.moveTo(c1.x, c1.y); ctx.lineTo(c2.x, c2.y);
+    ctx.lineTo(c3.x, c3.y); ctx.lineTo(c4.x, c4.y); ctx.closePath(); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // Longitudinal grid lines: floor, ceiling, both walls.
+  const longLines = [];
+  for (let x = -TRENCH_HALF_W; x <= TRENCH_HALF_W + 0.01; x += TRENCH_HALF_W / 2) {
+    longLines.push([{ x, y: -TRENCH_HALF_H, z: 4 }, { x, y: -TRENCH_HALF_H, z: SPAWN_Z }]);
+    longLines.push([{ x, y: TRENCH_HALF_H, z: 4 }, { x, y: TRENCH_HALF_H, z: SPAWN_Z }]);
+  }
+  for (let y = -TRENCH_HALF_H; y <= TRENCH_HALF_H + 0.01; y += TRENCH_HALF_H / 2) {
+    longLines.push([{ x: -TRENCH_HALF_W, y, z: 4 }, { x: -TRENCH_HALF_W, y, z: SPAWN_Z }]);
+    longLines.push([{ x: TRENCH_HALF_W, y, z: 4 }, { x: TRENCH_HALF_W, y, z: SPAWN_Z }]);
+  }
+  for (const [a, b] of longLines) line(a, b, "#ff2fb3", 2, 0.6);
+
+  // Energy cores: pulsing cyan diamonds.
+  for (const o of G.orbs) {
+    const p = project(o.x, o.y + Math.sin(G.t * 3 + o.phase) * 0.18, o.z);
+    if (!p) continue;
+    const r = Math.max(3, p.s * 0.28) * (1 + 0.25 * Math.sin(G.t * 6 + o.phase));
+    ctx.globalAlpha = clamp(1.2 - o.z / SPAWN_Z, 0.25, 1);
+    ctx.fillStyle = "#37f4ff";
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y - r); ctx.lineTo(p.x + r * 0.7, p.y);
+    ctx.lineTo(p.x, p.y + r); ctx.lineTo(p.x - r * 0.7, p.y);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // Laser gates: glowing bars with a gap, far to near.
+  const sorted = G.gates.slice().sort((a, b) => b.z - a.z);
+  for (const g of sorted) {
+    if (g.z < 3 || g.z > SPAWN_Z) continue;
+    const fade = clamp(1.15 - g.z / SPAWN_Z, 0.2, 1);
+    const glow = 0.55 + 0.45 * Math.sin(G.t * 9 + g.z);
+    ctx.globalAlpha = fade;
+    if (g.kind === "v") {
+      // Left bar and right bar, gap in the middle.
+      drawBar(-TRENCH_HALF_W, g.c - g.half, g.z, "x", glow);
+      drawBar(g.c + g.half, TRENCH_HALF_W, g.z, "x", glow);
+    } else {
+      // Bottom bar and top bar.
+      drawBar(-TRENCH_HALF_H, g.c - g.half, g.z, "y", glow);
+      drawBar(g.c + g.half, TRENCH_HALF_H, g.z, "y", glow);
+    }
+    // Gap markers: small chevrons pointing through the opening.
+    const gp = g.kind === "v" ? project(g.c, 0, g.z) : project(0, g.c, g.z);
+    if (gp) {
+      ctx.fillStyle = "#ffe14d";
+      const r = Math.max(4, gp.s * 0.12);
+      ctx.beginPath();
+      ctx.moveTo(gp.x, gp.y - r); ctx.lineTo(gp.x + r, gp.y + r); ctx.lineTo(gp.x - r, gp.y + r);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // Particles (3D shards).
+  for (const p of G.parts) {
+    const q = project(p.x, p.y, p.z);
+    if (!q) continue;
+    const a = 1 - p.life / p.maxLife;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    const s = Math.max(1, p.size * q.s / 22);
+    ctx.fillRect(q.x - s / 2, q.y - s / 2, s, s);
+  }
+  ctx.globalAlpha = 1;
+
+  // The ship.
+  drawShip();
+
+  // Popups: rising, fading score text.
+  ctx.textAlign = "center";
+  for (const p of G.pops) {
+    const q = project(p.x, p.y + (1 - p.life / p.maxLife) * 1.2, PLAYER_Z);
+    if (!q) continue;
+    const a = 1 - p.life / p.maxLife;
+    ctx.globalAlpha = a;
+    ctx.font = "bold " + (p.big ? 44 : 28) + "px 'Courier New', monospace";
+    ctx.fillStyle = p.color;
+    ctx.fillText(p.text, q.x, q.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // Near-miss flash wash.
+  if (G.flash > 0) {
+    ctx.fillStyle = "rgba(255, 225, 77, " + (G.flash * 0.16) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  ctx.restore();
+  drawHUD();
+  if (G.mode === "title") drawTitle();
+  if (G.mode === "over") drawGameOver();
+}
+
+// One glowing bar of a gate, spanning part of the trench cross-section.
+function drawBar(from, to, z, axis, glow) {
+  if (to <= from) return;
+  const w = Math.max(2, 340 / (z + CAM_Z));
+  ctx.lineWidth = w;
+  ctx.strokeStyle = "rgba(255, 70, 60, " + (0.55 + 0.4 * glow) + ")";
+  ctx.beginPath();
+  if (axis === "x") {
+    const a = project(from, -TRENCH_HALF_H, z), b = project(to, -TRENCH_HALF_H, z);
+    const c = project(to, TRENCH_HALF_H, z), d = project(from, TRENCH_HALF_H, z);
+    if (!a || !b || !c || !d) return;
+    // A bar is a quad: draw its near face as a thick band.
+    ctx.moveTo((a.x + d.x) / 2, (a.y + d.y) / 2);
+    ctx.lineTo((b.x + c.x) / 2, (b.y + c.y) / 2);
+  } else {
+    const a = project(-TRENCH_HALF_W, from, z), b = project(TRENCH_HALF_W, from, z);
+    const c = project(TRENCH_HALF_W, to, z), d = project(-TRENCH_HALF_W, to, z);
+    if (!a || !b || !c || !d) return;
+    ctx.moveTo((a.x + d.x) / 2, (a.y + d.y) / 2);
+    ctx.lineTo((b.x + c.x) / 2, (b.y + c.y) / 2);
+  }
+  ctx.stroke();
+  // Hot core line down the middle of the bar.
+  ctx.strokeStyle = "rgba(255, 220, 220, 0.9)";
+  ctx.lineWidth = Math.max(1, w * 0.25);
+  ctx.stroke();
+}
+
+function drawShip() {
+  const P = G.player;
+  const q = project(P.x, P.y, PLAYER_Z);
+  if (!q) return;
+  const s = q.s;
+  const blink = G.invuln > 0 && Math.floor(G.t * 14) % 2 === 0;
+  ctx.save();
+  ctx.translate(q.x, q.y);
+  ctx.rotate(P.tilt);
+  const sc = s / 46;
+  ctx.scale(sc, sc);
+  if (!blink) {
+    // Engine glow.
+    const eg = ctx.createRadialGradient(0, 14, 2, 0, 14, 26);
+    eg.addColorStop(0, "rgba(55, 244, 255, 0.85)");
+    eg.addColorStop(1, "rgba(55, 244, 255, 0)");
+    ctx.fillStyle = eg;
+    ctx.beginPath(); ctx.arc(0, 14, 26, 0, TAU); ctx.fill();
+    // Hull: a swept dart with twin wings.
+    ctx.fillStyle = "#e8f6ff";
+    ctx.strokeStyle = "#ff2fb3"; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(0, -26); ctx.lineTo(9, 6); ctx.lineTo(26, 16); ctx.lineTo(10, 12);
+    ctx.lineTo(5, 18); ctx.lineTo(-5, 18); ctx.lineTo(-10, 12); ctx.lineTo(-26, 16);
+    ctx.lineTo(-9, 6); ctx.closePath(); ctx.fill(); ctx.stroke();
+    // Canopy.
+    ctx.fillStyle = "#22d3ee";
+    ctx.beginPath(); ctx.ellipse(0, -8, 5, 10, 0, 0, TAU); ctx.fill();
+    // Wing lights.
+    ctx.fillStyle = "#ffe14d";
+    ctx.beginPath(); ctx.arc(-20, 14, 2.4, 0, TAU); ctx.arc(20, 14, 2.4, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.textAlign = "left";
+  ctx.font = "bold 30px 'Courier New', monospace";
+  ctx.fillStyle = "#7df9ff";
+  ctx.fillText("SCORE " + Math.floor(G.score), 28, 52);
+  ctx.fillStyle = "#ff9df9";
+  ctx.fillText("VEL " + Math.floor(G.speed * 9.2) + " KM/H", 28, 92);
+  // Hull pips.
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i < G.hull ? "#ff5a3c" : "rgba(255,90,60,0.25)";
+    ctx.beginPath(); ctx.arc(44 + i * 34, 128, 11, 0, TAU); ctx.fill();
+  }
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#ffe14d";
+  ctx.fillText("CORES " + G.cores, W - 28, 52);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText("COMBO x" + G.combo, W - 28, 92);
+  // Autopilot badge + live pilot readout (bottom center, clear of the HUD).
+  if (G.autopilot) {
+    ctx.textAlign = "center";
+    ctx.font = "bold 26px 'Courier New', monospace";
+    ctx.fillStyle = "#f0f";
+    ctx.fillText("AI DEMO PILOT  •  " + G.pilotInfo.action +
+      (G.pilotInfo.eta ? "  ETA " + G.pilotInfo.eta.toFixed(2) + "s" : ""), CX, H - 44);
+  }
+}
+
+function drawTitle() {
+  ctx.fillStyle = "rgba(2, 1, 8, 0.55)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ff2fb3";
+  ctx.font = "bold 92px 'Courier New', monospace";
+  ctx.fillText("HYPERDRIVE", CX, 380);
+  ctx.fillStyle = "#7df9ff";
+  ctx.font = "bold 92px 'Courier New', monospace";
+  ctx.fillText("TRENCH 3D", CX, 480);
+  ctx.fillStyle = "#ffe14d";
+  ctx.font = "bold 30px 'Courier New', monospace";
+  ctx.fillText("ONE PROMPT.  ZERO ASSETS.  3D ENGINE.", CX, 550);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "26px 'Courier New', monospace";
+  ctx.fillText("ARROWS / WASD / DRAG to fly  •  A = AI PILOT  •  M = SOUND", CX, 640);
+  ctx.fillText("Dodge the laser gates. Grab the cores. Chase the near-miss.", CX, 682);
+  ctx.fillStyle = "#37f4ff";
+  ctx.font = "bold 34px 'Courier New', monospace";
+  ctx.fillText("— CLICK OR TAP TO LAUNCH —", CX, 780);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = "rgba(20, 1, 8, 0.6)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ff5a3c";
+  ctx.font = "bold 84px 'Courier New', monospace";
+  ctx.fillText("SHIP DOWN", CX, 460);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 34px 'Courier New', monospace";
+  ctx.fillText("SCORE " + Math.floor(G.score) + "   •   NEAR MISSES " + G.nearMiss +
+    "   •   BEST COMBO x" + G.bestCombo, CX, 540);
+  ctx.fillStyle = "#7df9ff";
+  ctx.font = "28px 'Courier New', monospace";
+  ctx.fillText(G.autopilot ? "AI PILOT REBOOTING…" : "CLICK TO FLY AGAIN", CX, 620);
+}
+
+// ---------- flow, input, loop ----------
+function startRun() {
+  resetRun();
+  G.mode = "playing";
+  AudioSys.unlock();
+}
+
+function setAutopilot(on) {
+  G.autopilot = on;
+  document.getElementById("pilotBtn").classList.toggle("on", on);
+  if (on && G.mode !== "playing") startRun();
+}
+
+document.getElementById("pilotBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  setAutopilot(!G.autopilot);
+});
+document.getElementById("muteBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const on = AudioSys.toggleMute();
+  document.getElementById("muteBtn").textContent = on ? "SOUND ON" : "MUTED";
+});
+
+addEventListener("keydown", (e) => {
+  G.keys[e.code] = true;
+  if (e.code === "KeyA") setAutopilot(!G.autopilot);
+  if (e.code === "KeyM") {
+    const on = AudioSys.toggleMute();
+    document.getElementById("muteBtn").textContent = on ? "SOUND ON" : "MUTED";
+  }
+  if (e.code === "Space" || e.code === "Enter") {
+    if (G.mode !== "playing") startRun();
+    e.preventDefault();
+  }
+});
+addEventListener("keyup", (e) => { G.keys[e.code] = false; });
+
+// Pointer drag steers the ship directly.
+let dragging = false;
+function steerTo(clientX, clientY) {
+  const r = cv.getBoundingClientRect();
+  const nx = (clientX - r.left) / r.width * 2 - 1;
+  const ny = (clientY - r.top) / r.height * 2 - 1;
+  G.player.vx += clamp((nx * 5.6 - G.player.x) * 9 - G.player.vx * 3, -140, 140) * 0.016;
+  G.player.vy += clamp((-ny * 3.0 - G.player.y) * 9 - G.player.vy * 3, -120, 120) * 0.016;
+}
+cv.addEventListener("pointerdown", (e) => {
+  dragging = true;
+  AudioSys.unlock();
+  if (G.mode !== "playing") { startRun(); return; }
+  steerTo(e.clientX, e.clientY);
+});
+cv.addEventListener("pointermove", (e) => { if (dragging) steerTo(e.clientX, e.clientY); });
+addEventListener("pointerup", () => { dragging = false; });
+
+let lastT = 0;
+function frame(ts) {
+  const dt = Math.min(0.05, (ts - lastT) / 1000 || 0.016);
+  lastT = ts;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+// Recorder hooks: deterministic fixed-step capture for the video shoot.
+window.__hyper = {
+  startDemo() { setAutopilot(true); if (G.mode !== "playing") startRun(); },
+  step(dt) { update(dt); render(); },
+  state() {
+    return { mode: G.mode, score: Math.floor(G.score), speed: G.speed,
+      hull: G.hull, nearMiss: G.nearMiss, cores: G.cores, combo: G.combo,
+      autopilot: G.autopilot, t: G.t };
+  },
+};
+
+resetRun();
+if (DEMO || STEP_MODE) document.getElementById("btns").style.display = "none";
+if (DEMO) { setAutopilot(true); startRun(); }
+render();
+if (!STEP_MODE) requestAnimationFrame(frame);
+</script>
+</body>
+</html>
